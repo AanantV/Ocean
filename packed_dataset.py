@@ -44,9 +44,6 @@ class PackedTokenDataset:
         self.shards = [np.load(p, mmap_mode="r") for p in shard_paths]
         self.shard_lengths = [len(s) for s in self.shards]
 
-        # Number of full (seq_len + 1) windows available per shard. The +1 is
-        # for the input/target shift: a window of seq_len+1 tokens gives us
-        # input = window[:-1], target = window[1:].
         self.windows_per_shard = [
             max(0, (length - 1) // seq_len) for length in self.shard_lengths
         ]
@@ -86,16 +83,21 @@ class PackedTokenDataset:
 
 class PackedTokenTorchDataset(PackedTokenDataset):
     """torch.utils.data.Dataset wrapper. Split out from the base class so the
-    core logic + self-test have no hard torch dependency."""
+    core logic + self-test have no hard torch dependency.
 
-    def __init__(self, shard_dir: str, split_prefix: str, seq_len: int):
-        super().__init__(shard_dir, split_prefix, seq_len)
-        import torch  # local import: only needed if you actually use this class
-        self._torch = torch
+    NOTE: torch is imported inside __getitem__ (not stored as a self.
+    attribute) deliberately. Storing a reference to the torch module on the
+    instance (e.g. self._torch = torch) breaks Windows multiprocessing
+    DataLoader workers: Windows uses the 'spawn' start method, which pickles
+    the entire Dataset object to hand to each worker process, and Python
+    modules cannot be pickled ("cannot pickle 'module' object"). Importing
+    inside the method avoids storing any unpicklable reference on self.
+    """
 
     def __getitem__(self, idx: int):
+        import torch
         input_ids, targets = self.get_window_numpy(idx)
-        return self._torch.from_numpy(input_ids), self._torch.from_numpy(targets)
+        return torch.from_numpy(input_ids), torch.from_numpy(targets)
 
 
 def test_packed_dataset():
@@ -107,11 +109,9 @@ def test_packed_dataset():
     with tempfile.TemporaryDirectory() as tmp:
         seq_len = 4
 
-        # Shard 0: 10 tokens -> (10-1)//4 = 2 full windows, 1 leftover token unused
         shard0 = np.arange(0, 10, dtype=np.uint16)
         np.save(os.path.join(tmp, "train_00000.npy"), shard0)
 
-        # Shard 1: 9 tokens -> (9-1)//4 = 2 full windows, 0 leftover
         shard1 = np.arange(100, 109, dtype=np.uint16)
         np.save(os.path.join(tmp, "train_00001.npy"), shard1)
 
