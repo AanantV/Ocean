@@ -160,8 +160,15 @@ def main():
     print(f"Model: Pacific-{args.model_size} | {n_params:,} params ({n_params/1e6:.1f}M)")
 
     # --- Data ---
-    train_ds = PackedTokenTorchDataset(args.data_dir, "train", seq_len=args.seq_len)
-    val_ds = PackedTokenTorchDataset(args.data_dir, "val", seq_len=args.seq_len)
+    # tokenize_and_pack.py writes shards into <data_dir>/train/ and
+    # <data_dir>/val/ subfolders (not directly in data_dir), so point the
+    # dataset loader at those subfolders specifically.
+    train_ds = PackedTokenTorchDataset(
+        os.path.join(args.data_dir, "train"), "train", seq_len=args.seq_len
+    )
+    val_ds = PackedTokenTorchDataset(
+        os.path.join(args.data_dir, "val"), "val", seq_len=args.seq_len
+    )
     print(f"Train sequences: {len(train_ds):,} | Val sequences: {len(val_ds):,}")
 
     train_loader = DataLoader(
