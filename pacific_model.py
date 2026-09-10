@@ -33,6 +33,7 @@ class PacificConfig:
     rms_norm_eps: float = 1e-5
     dropout: float = 0.0       # pretraining typically uses 0
     tie_embeddings: bool = True
+    gradient_checkpointing: bool = False  # trade compute for memory; see PacificModel.forward
 
 
 # ---------------------------------------------------------------------------
@@ -48,6 +49,7 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Compute in float32 for numerical stability regardless of input dtype
         dtype = x.dtype
         x = x.float()
         norm = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
@@ -58,7 +60,11 @@ class RMSNorm(nn.Module):
 # Rotary Positional Embeddings (RoPE)
 # ---------------------------------------------------------------------------
 def precompute_rope_freqs(head_dim: int, max_seq_len: int, theta: float = 10000.0):
-    """Precompute the rotation frequencies used by RoPE."""
+    """Precompute the rotation frequencies used by RoPE.
+
+    Returns a complex tensor of shape (max_seq_len, head_dim // 2) that we
+    multiply elementwise against query/key vectors viewed as complex numbers.
+    """
     assert head_dim % 2 == 0, "RoPE requires an even head_dim"
     freqs = 1.0 / (theta ** (torch.arange(0, head_dim, 2).float() / head_dim))
     positions = torch.arange(max_seq_len).float()
@@ -84,6 +90,8 @@ class GQAAttention(nn.Module):
     of query heads. n_heads must be divisible by n_kv_heads.
 
     With n_heads=16, n_kv_heads=4: every 4 query heads share 1 kv head.
+    This cuts KV-cache size by 4x at inference time vs. standard MHA,
+    with little to no quality loss at this scale.
     """
 
     def __init__(self, cfg: PacificConfig):
@@ -110,14 +118,18 @@ class GQAAttention(nn.Module):
         q = apply_rope(q, rope_freqs)
         k = apply_rope(k, rope_freqs)
 
+        # Expand kv heads to match query heads (repeat, not re-project)
         if self.n_rep > 1:
             k = k.repeat_interleave(self.n_rep, dim=2)
             v = v.repeat_interleave(self.n_rep, dim=2)
 
+        # (b, n_heads, s, head_dim) for attention
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
+        # Causal scaled-dot-product attention (uses flash attention kernels
+        # under the hood when available on the running hardware/torch build)
         out = F.scaled_dot_product_attention(
             q, k, v,
             is_causal=True,
@@ -132,7 +144,8 @@ class GQAAttention(nn.Module):
 # SwiGLU Feed-Forward
 # ---------------------------------------------------------------------------
 class SwiGLU(nn.Module):
-    """SwiGLU FFN: gate(x) * up(x), then down-projected."""
+    """SwiGLU FFN: gate(x) * up(x), then down-projected. Current best-practice
+    activation for LLM FFN blocks (used in Llama, Mistral, etc.)."""
 
     def __init__(self, cfg: PacificConfig):
         super().__init__()
@@ -156,6 +169,7 @@ class TransformerBlock(nn.Module):
         self.ffn = SwiGLU(cfg)
 
     def forward(self, x: torch.Tensor, rope_freqs: torch.Tensor) -> torch.Tensor:
+        # Pre-norm residual blocks: norm -> sublayer -> add residual
         x = x + self.attn(self.attn_norm(x), rope_freqs)
         x = x + self.ffn(self.ffn_norm(x))
         return x
@@ -198,7 +212,19 @@ class PacificModel(nn.Module):
         rope_freqs = self.rope_freqs.to(x.device)
 
         for layer in self.layers:
-            x = layer(x, rope_freqs)
+            if self.cfg.gradient_checkpointing and self.training:
+                # Recomputes activations during backward instead of storing
+                # them — trades extra compute for a large activation-memory
+                # saving. Not needed for Pacific-nano on a laptop GPU, but
+                # matters once you move to Pacific-mini (or bigger) on
+                # memory-constrained hardware. use_reentrant=False is the
+                # modern, recommended mode (avoids some autograd edge cases
+                # the old reentrant implementation has).
+                x = torch.utils.checkpoint.checkpoint(
+                    layer, x, rope_freqs, use_reentrant=False
+                )
+            else:
+                x = layer(x, rope_freqs)
 
         x = self.final_norm(x)
         logits = self.lm_head(x)
@@ -224,6 +250,7 @@ if __name__ == "__main__":
     model = PacificModel(cfg)
     print(f"Total params: {model.num_params():,}")
 
+    # Quick smoke test with dummy data
     x = torch.randint(0, cfg.vocab_size, (2, 128))
     y = torch.randint(0, cfg.vocab_size, (2, 128))
     logits, loss = model(x, y)
